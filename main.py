@@ -65,7 +65,8 @@ _BTN_DEFS      = [
     {"id": "color_0", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X,                                   "w": _COLOR_BTN_W},
     {"id": "color_1", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + _COLOR_BTN_W + _COLOR_BTN_GAP,   "w": _COLOR_BTN_W},
     {"id": "color_2", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + 2*(_COLOR_BTN_W+_COLOR_BTN_GAP), "w": _COLOR_BTN_W},
-    {"id": "quit",    "y": 12 + 3 * (_BTN_H + 10)},
+    {"id": "guardar", "y": 12 + 3 * (_BTN_H + 10)},
+    {"id": "quit",    "y": 12 + 4 * (_BTN_H + 10)},
 ]
 
 # Constantes NUI API (Kinect SDK v1.8)
@@ -82,6 +83,14 @@ latest_result: GestureRecognizerResult | None = None
 frame_lock     = threading.Lock()
 result_lock    = threading.Lock()
 running        = True
+
+# OCR (deteccion de texto escrito en el canvas)
+try:
+    import easyocr as _easyocr
+    _EASYOCR_AVAILABLE = True
+except ImportError:
+    _EASYOCR_AVAILABLE = False
+_ocr_reader = None
 
 
 # Callback de MediaPipe (modo LIVE_STREAM)
@@ -653,9 +662,10 @@ def draw_ui_buttons(
 ) -> np.ndarray:
     """Dibuja los botones UI sobre el frame con indicador de progreso de hover."""
     labels = {
-        "toggle": "Lapiz: ON " if drawing_mode else "Lapiz: OFF",
-        "clear":  "Limpiar",
-        "quit":   "Salir",
+        "toggle":  "Lapiz: ON " if drawing_mode else "Lapiz: OFF",
+        "clear":   "Limpiar",
+        "guardar": "Guardar",
+        "quit":    "Salir",
     }
     for btn in _BTN_DEFS:
         bid  = btn["id"]
@@ -719,6 +729,54 @@ def draw_ui_buttons(
     return frame
 
 
+# OCR helpers
+def _get_ocr_reader():
+    """Inicializa EasyOCR la primera vez que se llama (cargado perezoso)."""
+    global _ocr_reader
+    if not _EASYOCR_AVAILABLE:
+        return None
+    if _ocr_reader is None:
+        print("[OCR] Inicializando EasyOCR (puede tardar la primera vez)...")
+        _ocr_reader = _easyocr.Reader(["es", "en"], gpu=False)
+        print("[OCR] Listo.")
+    return _ocr_reader
+
+
+def save_snapshot(output_frame: np.ndarray, canvas: np.ndarray) -> None:
+    """
+    Guarda `output_frame` como PNG y detecta el texto dibujado en `canvas`
+    con EasyOCR, guardando el resultado en un .txt.
+    El OCR se ejecuta en un hilo de fondo para no bloquear la UI.
+    """
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    img_path  = str(BASE_DIR / f"captura_{timestamp}.png")
+    txt_path  = str(BASE_DIR / f"texto_{timestamp}.txt")
+
+    cv2.imwrite(img_path, output_frame)
+    print(f"[Guardar] Imagen -> {img_path}")
+
+    canvas_copy = canvas.copy()
+
+    def _ocr_task():
+        reader = _get_ocr_reader()
+        if reader is not None:
+            gray = cv2.cvtColor(canvas_copy, cv2.COLOR_BGR2GRAY)
+            _, mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+            # Dilatar levemente para engrosar trazos finos
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            mask   = cv2.dilate(mask, kernel, iterations=1)
+            inv    = cv2.bitwise_not(mask)  # texto negro sobre fondo blanco
+            results = reader.readtext(inv, detail=0)
+            text    = "\n".join(results) if results else "(Sin texto detectado)"
+        else:
+            text = "(easyocr no instalado - ejecuta: pip install easyocr)"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"[Guardar] Texto  -> {txt_path}")
+
+    threading.Thread(target=_ocr_task, daemon=True).start()
+
+
 # Bucle principal
 def main():
     global running
@@ -756,6 +814,11 @@ def main():
     prev_index_pts: dict = {} # hand_label -> (x, y)
     drawing_mode   = True
     color_idx      = 0  # indice en PENCIL_COLORS
+
+    # Estado del guardado
+    pending_save   = False
+    save_msg       = ""
+    save_msg_until = 0.0
 
     # Estado de los botones UI
     hover_start:    dict = {} # btn_id -> timestamp inicio hover
@@ -853,12 +916,32 @@ def main():
                 prev_index_pts.clear()
             elif action in ("color_0", "color_1", "color_2"):
                 color_idx = int(action[-1])
+            elif action == "guardar":
+                pending_save = True
             elif action == "quit":
                 quit_flag = True
 
             output = draw_results(frame.copy(), snap)
             output = cv2.add(output, drawing_canvas)
             output = draw_ui_buttons(output, drawing_mode, hover_prog, color_idx)
+
+            # Guardar snapshot despues de renderizar para incluir todo
+            if pending_save:
+                save_snapshot(output.copy(), drawing_canvas)
+                save_msg       = "Guardado!"
+                save_msg_until = time.time() + 3.0
+                pending_save   = False
+
+            # Mensaje de confirmacion de guardado
+            now_t = time.time()
+            if save_msg and now_t < save_msg_until:
+                (tw, th), _ = cv2.getTextSize(save_msg, FONT, 0.9, 2)
+                sx = (FRAME_WIDTH  - tw) // 2
+                sy = (FRAME_HEIGHT + th) // 2
+                cv2.rectangle(output, (sx - 12, sy - th - 10),
+                              (sx + tw + 12, sy + 10), COLOR_BLACK, -1)
+                cv2.putText(output, save_msg, (sx, sy),
+                            FONT, 0.9, COLOR_GREEN, 2, cv2.LINE_AA)
 
             cv2.putText(
                 output,
