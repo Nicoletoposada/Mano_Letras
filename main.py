@@ -57,11 +57,15 @@ BTN_COOLDOWN_S = 1.5
 _BTN_W         = 162
 _BTN_H         = 48
 _BTN_X         = 12
+_COLOR_BTN_W   = 50
+_COLOR_BTN_GAP = 6
 _BTN_DEFS      = [
-    {"id": "toggle", "y": 12},
-    {"id": "clear",  "y": 12 + _BTN_H + 10},
-    {"id": "color",  "y": 12 + 2 * (_BTN_H + 10)},
-    {"id": "quit",   "y": 12 + 3 * (_BTN_H + 10)},
+    {"id": "toggle",  "y": 12},
+    {"id": "clear",   "y": 12 + _BTN_H + 10},
+    {"id": "color_0", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X,                                   "w": _COLOR_BTN_W},
+    {"id": "color_1", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + _COLOR_BTN_W + _COLOR_BTN_GAP,   "w": _COLOR_BTN_W},
+    {"id": "color_2", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + 2*(_COLOR_BTN_W+_COLOR_BTN_GAP), "w": _COLOR_BTN_W},
+    {"id": "quit",    "y": 12 + 3 * (_BTN_H + 10)},
 ]
 
 # Constantes NUI API (Kinect SDK v1.8)
@@ -636,7 +640,9 @@ def _is_index_only_up(hand_landmarks) -> bool:
 # Helpers de la UI de botones
 def _finger_on_button(cx: int, cy: int, btn: dict) -> bool:
     """Devuelve True si el punto (cx, cy) esta dentro del area del boton."""
-    return _BTN_X <= cx <= _BTN_X + _BTN_W and btn["y"] <= cy <= btn["y"] + _BTN_H
+    bx = btn.get("x", _BTN_X)
+    bw = btn.get("w", _BTN_W)
+    return bx <= cx <= bx + bw and btn["y"] <= cy <= btn["y"] + _BTN_H
 
 
 def draw_ui_buttons(
@@ -649,15 +655,44 @@ def draw_ui_buttons(
     labels = {
         "toggle": "Lapiz: ON " if drawing_mode else "Lapiz: OFF",
         "clear":  "Limpiar",
-        "color":  f"Color: {PENCIL_COLORS[color_idx][3]}",
         "quit":   "Salir",
     }
     for btn in _BTN_DEFS:
         bid  = btn["id"]
-        x1, y1 = _BTN_X, btn["y"]
-        x2, y2 = x1 + _BTN_W, y1 + _BTN_H
+        bx   = btn.get("x", _BTN_X)
+        bw   = btn.get("w", _BTN_W)
+        x1, y1 = bx, btn["y"]
+        x2, y2 = x1 + bw, y1 + _BTN_H
         prog   = hover_prog.get(bid, 0.0)
 
+        # Botones de color: fondo solido del propio color
+        if bid.startswith("color_"):
+            cidx     = int(bid[-1])
+            dot_color = PENCIL_COLORS[cidx][:3]
+            selected  = (cidx == color_idx)
+
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), dot_color, -1)
+            cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+            border_clr   = COLOR_WHITE if selected else (80, 80, 80)
+            border_thick = 3 if selected else 1
+            cv2.rectangle(frame, (x1, y1), (x2, y2), border_clr, border_thick, cv2.LINE_AA)
+
+            name = PENCIL_COLORS[cidx][3]
+            (tw, th), _ = cv2.getTextSize(name, FONT, 0.42, 1)
+            tx = x1 + (bw - tw) // 2
+            ty = y1 + (_BTN_H + th) // 2
+            cv2.putText(frame, name, (tx, ty), FONT, 0.42, COLOR_WHITE, 1, cv2.LINE_AA)
+
+            if prog > 0:
+                center = (x1 + bw // 2, y1 + _BTN_H // 2)
+                cv2.circle(frame, center, 11, (80, 80, 80), 1, cv2.LINE_AA)
+                cv2.ellipse(frame, center, (11, 11), -90, 0, int(360 * prog),
+                            (60, 230, 60), 3, cv2.LINE_AA)
+            continue
+
+        # Botones normales
         overlay = frame.copy()
         bg = (50, 80, 130) if prog > 0 else (35, 35, 35)
         cv2.rectangle(overlay, (x1, y1), (x2, y2), bg, -1)
@@ -668,17 +703,9 @@ def draw_ui_buttons(
 
         label = labels[bid]
         (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 1)
-        tx = x1 + (_BTN_W - tw) // 2
+        tx = x1 + (bw - tw) // 2
         ty = y1 + (_BTN_H + th) // 2
         cv2.putText(frame, label, (tx, ty), FONT, 0.55, COLOR_WHITE, 1, cv2.LINE_AA)
-
-        # Circulo de color para el boton de seleccion de color
-        if bid == "color":
-            dot_color = PENCIL_COLORS[color_idx][:3]
-            dot_x = x1 + 14
-            dot_y = y1 + _BTN_H // 2
-            cv2.circle(frame, (dot_x, dot_y), 7, dot_color, -1, cv2.LINE_AA)
-            cv2.circle(frame, (dot_x, dot_y), 7, COLOR_WHITE, 1, cv2.LINE_AA)
 
         if prog > 0:
             center = (x2 - 18, y1 + _BTN_H // 2)
@@ -824,8 +851,8 @@ def main():
             elif action == "clear":
                 drawing_canvas[:] = 0
                 prev_index_pts.clear()
-            elif action == "color":
-                color_idx = (color_idx + 1) % len(PENCIL_COLORS)
+            elif action in ("color_0", "color_1", "color_2"):
+                color_idx = int(action[-1])
             elif action == "quit":
                 quit_flag = True
 
