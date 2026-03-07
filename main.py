@@ -41,6 +41,7 @@ COLOR_WHITE        = (255, 255, 255)
 COLOR_BLACK        = (0, 0, 0)
 
 PENCIL_THICKNESS   = 4
+BRIGHTNESS_BETA    = 50   # Incremento de brillo (0 = sin cambio, max ~100)
 PENCIL_COLORS = [
     (0,   0, 255, "Rojo"),    # BGR
     (0, 255,   0, "Verde"),
@@ -921,7 +922,10 @@ def main():
                 cv2.waitKey(10)
                 continue
 
-            frame = cv2.flip(frame, 1) # modo espejo (flip horizontal)
+            if BRIGHTNESS_BETA != 0:
+                frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=BRIGHTNESS_BETA)
+
+            #frame = cv2.flip(frame, 1) # modo espejo (flip horizontal)
 
             rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_img   = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
