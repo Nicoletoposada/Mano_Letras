@@ -70,8 +70,10 @@ _BTN_DEFS      = [
 ]
 
 # Constantes NUI API (Kinect SDK v1.8)
-NUI_INITIALIZE_FLAG_USES_COLOR  = 0x00000080
-NUI_IMAGE_TYPE_COLOR            = 0
+# NOTA: la camara de color requiere inicializar tambien el stream de depth
+NUI_INITIALIZE_FLAG_USES_DEPTH_AND_PLAYER_INDEX = 0x00000002
+NUI_INITIALIZE_FLAG_USES_COLOR  = 0x00000004
+NUI_IMAGE_TYPE_COLOR            = 1   # 0=depth+player, 1=color RGB
 NUI_IMAGE_RESOLUTION_640x480    = 2
 NUI_IMAGE_STREAM_FLAG_DEFAULT   = 0x00000000
 POOL_SIZE                       = 2
@@ -140,7 +142,10 @@ class KinectNUI:
         self._setup_prototypes()
 
         # Inicializar el runtime NUI
-        hr = self._dll.NuiInitialize(NUI_INITIALIZE_FLAG_USES_COLOR)
+        # El stream de color requiere USES_COLOR | USES_DEPTH_AND_PLAYER_INDEX
+        _init_flags = (NUI_INITIALIZE_FLAG_USES_COLOR
+                       | NUI_INITIALIZE_FLAG_USES_DEPTH_AND_PLAYER_INDEX)
+        hr = self._dll.NuiInitialize(_init_flags)
         if hr < 0:
             raise RuntimeError(f"NuiInitialize fallo: HRESULT=0x{hr & 0xFFFFFFFF:08X}")
 
@@ -170,11 +175,13 @@ class KinectNUI:
 
     def _setup_prototypes(self):
         dll = self._dll
-        dll.NuiInitialize.restype  = ctypes.HRESULT
+        # Usar c_long (no HRESULT) para evitar que ctypes lance excepciones
+        # automaticas en fallas; las comprobamos con 'if hr < 0'.
+        dll.NuiInitialize.restype  = ctypes.c_long
         dll.NuiInitialize.argtypes = [wt.DWORD]
         dll.NuiShutdown.restype    = None
         dll.NuiShutdown.argtypes   = []
-        dll.NuiImageStreamOpen.restype  = ctypes.HRESULT
+        dll.NuiImageStreamOpen.restype  = ctypes.c_long
         dll.NuiImageStreamOpen.argtypes = [
             ctypes.c_int,
             ctypes.c_int,
@@ -183,11 +190,11 @@ class KinectNUI:
             wt.HANDLE,
             ctypes.POINTER(ctypes.c_void_p),
         ]
-        dll.NuiImageStreamGetNextFrame.restype  = ctypes.HRESULT
+        dll.NuiImageStreamGetNextFrame.restype  = ctypes.c_long
         dll.NuiImageStreamGetNextFrame.argtypes = [
             ctypes.c_void_p, wt.DWORD, ctypes.c_void_p
         ]
-        dll.NuiImageStreamReleaseFrame.restype  = ctypes.HRESULT
+        dll.NuiImageStreamReleaseFrame.restype  = ctypes.c_long
         dll.NuiImageStreamReleaseFrame.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p
         ]
@@ -226,8 +233,16 @@ class KinectNUI:
                 kernel32.ResetEvent(self._event)
                 continue
 
-            # Puntero a INuiFrameTexture en offset 24
-            texture_ptr = ctypes.c_void_p.from_buffer(frame_buf, 24).value
+            # SDK v1.8: NuiImageStreamGetNextFrame escribe el PUNTERO al
+            # NUI_IMAGE_FRAME en los primeros 8 bytes del buffer (no llena
+            # el struct directamente como en versiones anteriores).
+            frame_ptr_val = ctypes.c_void_p.from_buffer(frame_buf, 0).value
+
+            # pFrameTexture (INuiFrameTexture*) esta en offset 24 del struct
+            texture_ptr = (
+                ctypes.c_void_p.from_address(frame_ptr_val + 24).value
+                if frame_ptr_val else None
+            )
 
             if texture_ptr:
                 # vtable de INuiFrameTexture:
@@ -236,10 +251,14 @@ class KinectNUI:
                 # 5:LockRect        6:GetLevelDesc   7:UnlockRect
                 LOCKED_RECT_SIZE = 16
                 locked_rect = (ctypes.c_byte * LOCKED_RECT_SIZE)()
-                vtable = ctypes.cast(texture_ptr, ctypes.POINTER(ctypes.c_void_p))
+                # Doble indirección: texture_ptr -> vtable_ptr -> vtable entries
+                vtable = ctypes.cast(
+                    ctypes.cast(texture_ptr, ctypes.POINTER(ctypes.c_void_p))[0],
+                    ctypes.POINTER(ctypes.c_void_p),
+                )
 
                 LockRect = ctypes.WINFUNCTYPE(
-                    ctypes.HRESULT,
+                    ctypes.c_long,
                     ctypes.c_void_p, ctypes.c_uint,
                     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
                 )(vtable[5])
@@ -264,13 +283,15 @@ class KinectNUI:
                             latest_frame = bgr
 
                     UnlockRect = ctypes.WINFUNCTYPE(
-                        ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
+                        ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
                     )(vtable[7])
                     UnlockRect(texture_ptr, 0)
 
-            self._dll.NuiImageStreamReleaseFrame(
-                self._stream, ctypes.cast(frame_buf, ctypes.c_void_p)
-            )
+            # Liberar el frame usando el puntero devuelto por GetNextFrame
+            if frame_ptr_val:
+                self._dll.NuiImageStreamReleaseFrame(
+                    self._stream, ctypes.c_void_p(frame_ptr_val)
+                )
             kernel32.ResetEvent(self._event)
 
     def release(self):
@@ -449,10 +470,27 @@ def _enumerate_dshow_cameras() -> list[tuple[int, str, str]]:
     return results
 
 
+# Patrones de nombre conocidos de la camara Kinect Xbox 360
+_KINECT_NAME_KWS = ("xbox nui", "nui camera", "nui video", "nui sensor", "kinect", "nui")
+# VID Microsoft + PIDs conocidos de la Kinect v1: color=02BB, depth=02AE, audio=02BB
+_KINECT_VIDPIDS  = ("pid_02bb", "pid_02ae", "pid_02bf", "pid_02c3")
+
+
+def _is_kinect_device(name: str, path: str) -> bool:
+    """Devuelve True si el dispositivo DirectShow corresponde a la Kinect."""
+    nl = name.lower()
+    pl = path.lower()
+    if any(kw in nl for kw in _KINECT_NAME_KWS):
+        return True
+    if "vid_045e" in pl and any(p in pl for p in _KINECT_VIDPIDS):
+        return True
+    return False
+
+
 def _find_kinect_camera_index() -> int | None:
     """
     Detecta automaticamente el indice DirectShow de la camara Kinect.
-    Estrategias (en orden): nombre NUI/Kinect, VID:PID 045E:02BB, location hint.
+    Estrategias (en orden): nombre NUI/Kinect, VID:PID 045E:02BB/02AE, location hint.
     Imprime todos los dispositivos encontrados para facilitar depuracion.
     """
     devices = _enumerate_dshow_cameras()
@@ -463,20 +501,16 @@ def _find_kinect_camera_index() -> int | None:
     print("[Kinect] Dispositivos de video DirectShow detectados:")
     for idx, name, path in devices:
         print(f"  [{idx}] {name!r}")
+        if path:
+            print(f"        path={path!r}")
 
-    # 1. Nombre caracteristico del sensor de color Kinect
+    # 1. Nombre o VID/PID caracteristico del sensor de color Kinect
     for idx, name, path in devices:
-        if any(kw in name.lower() for kw in ("nui", "kinect", "xbox nui")):
-            print(f"[Kinect] Identificada por nombre -> indice {idx}: {name!r}")
+        if _is_kinect_device(name, path):
+            print(f"[Kinect] Identificada por nombre/VID/PID -> indice {idx}: {name!r}")
             return idx
 
-    # 2. VID:PID del sensor de color Kinect v1 (VID_045E&PID_02BB)
-    for idx, name, path in devices:
-        if "vid_045e" in path.lower() and "pid_02bb" in path.lower():
-            print(f"[Kinect] Identificada por VID/PID -> indice {idx}: {name!r}")
-            return idx
-
-    # 3. USB location hint en DevicePath
+    # 2. USB location hint en DevicePath
     hint = KINECT_USB_LOCATION.lower().replace(".", "_").replace("#", "_")
     for idx, name, path in devices:
         if hint in path.lower():
@@ -496,16 +530,25 @@ class KinectOpenCV:
 
     def __init__(self, index: int | None = None):
         self._cap = None
-        if index is None:
-            index = _find_kinect_camera_index()
-        scan_range = [index] if index is not None else range(10)
-        # Backends a intentar en orden: DSHOW, MSMF, auto
+        kinect_index = index  # indice especificado manualmente o None
+        if kinect_index is None:
+            kinect_index = _find_kinect_camera_index()
+
+        # Si ya tenemos un indice concreto (manual o deteccion automatica exitosa)
+        # solo probamos ese; en caso contrario escaneamos todos.
+        scan_range  = [kinect_index] if kinect_index is not None else range(10)
+        scan_all    = kinect_index is None
+
+        # Backends a intentar en orden: DSHOW primero (mas directo con hardware)
         backends = [
-            (cv2.CAP_DSHOW,  "DirectShow"),
-            (cv2.CAP_MSMF,   "MSMF"),
-            (cv2.CAP_ANY,    "auto"),
+            (cv2.CAP_DSHOW, "DirectShow"),
+            (cv2.CAP_MSMF,  "MSMF"),
+            (cv2.CAP_ANY,   "auto"),
         ]
-        found: list[int] = []
+
+        # Recolectar TODOS los indices funcionales junto con su cap abierto.
+        # Clave: dict {indice: cap} para poder elegir despues.
+        found_caps: dict[int, cv2.VideoCapture] = {}
 
         print("[Camara] Escaneando dispositivos de video...")
         for idx in scan_range:
@@ -516,7 +559,7 @@ class KinectOpenCV:
                     continue
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-                # Reintentar lectura hasta 5 veces (la Kinect tarda en entregar el 1er frame)
+                # Reintentar hasta 5 veces (la Kinect tarda en el 1er frame)
                 ret = False
                 for _ in range(5):
                     ret, _ = cap.read()
@@ -524,33 +567,74 @@ class KinectOpenCV:
                         break
                     time.sleep(0.1)
                 if ret:
-                    if idx not in found:
-                        found.append(idx)
-                    if self._cap is None:
-                        self._cap = cap
-                        print(f"[Camara] Indice {idx} ({bname}) -> OK (seleccionado)")
+                    print(f"[Camara] Indice {idx} ({bname}) -> OK")
+                    if idx not in found_caps:
+                        found_caps[idx] = cap
                     else:
-                        print(f"[Camara] Indice {idx} ({bname}) -> OK")
                         cap.release()
-                    break # backend OK para este indice, pasar al siguiente
+                    break  # backend OK para este indice
                 else:
-                    print(f"[Camara] Indice {idx} ({bname}) -> abre pero no lee frames")
+                    print(f"[Camara] Indice {idx} ({bname}) -> abre pero no entrega frames")
                     cap.release()
 
+        found = list(found_caps.keys())
         if not found:
             print("[Camara] No se detecto ningun dispositivo en los indices probados.")
         else:
-            print(f"[Camara] Dispositivos encontrados en indices: {found}")
-            if len(found) > 1:
-                print("[Camara] Si la Kinect no es el indice seleccionado, "
-                      f"cambia CAMERA_INDEX a otro valor de {found}.")
+            print(f"[Camara] Dispositivos funcionales en indices: {found}")
 
-        if self._cap is None:
+        # Elegir el indice correcto de la Kinect
+        chosen: int | None = None
+
+        if len(found) == 1:
+            # Solo una camara disponible: usarla directamente
+            chosen = found[0]
+
+        elif len(found) > 1:
+            if not scan_all:
+                # Teniamos un indice concreto y funciono
+                chosen = kinect_index
+            else:
+                # Varios candidatos sin indice previo:
+                # cruzar con enumeracion DirectShow para elegir la Kinect
+                devices = _enumerate_dshow_cameras()
+                for cam_idx, name, path in devices:
+                    if cam_idx in found and _is_kinect_device(name, path):
+                        chosen = cam_idx
+                        print(f"[Camara] Kinect identificada entre multiples camaras "
+                              f"-> indice {cam_idx}: {name!r}")
+                        break
+
+                if chosen is None:
+                    # Ultimo recurso: preferir el indice mas alto distinto de 0
+                    # (la webcam integrada del PC casi siempre ocupa el indice 0)
+                    non_zero = [i for i in found if i != 0]
+                    chosen   = non_zero[0] if non_zero else found[0]
+                    print(
+                        f"[AVISO] No se pudo identificar la Kinect entre los indices {found}.\n"
+                        f"[AVISO] Usando indice {chosen} (el menor != 0).\n"
+                        f"[AVISO] Si es incorrecto, establece CAMERA_INDEX manualmente "
+                        f"con uno de: {found}"
+                    )
+
+        if chosen is None or chosen not in found_caps:
+            # Liberar todas las caps abiertas antes de lanzar excepcion
+            for cap in found_caps.values():
+                cap.release()
             raise RuntimeError(
-                "No se encontro camara. Verifica que la Kinect este conectada "
-                "y los drivers instalados."
+                "No se encontro la camara Kinect.\n"
+                "  - Verifica que la Kinect este conectada y con drivers instalados.\n"
+                "  - Si se listo en los indices de arriba, establece CAMERA_INDEX "
+                "al indice correcto en la seccion de configuracion."
             )
-        print("[Kinect] Camara lista (OpenCV).")
+
+        # Conservar solo la cap elegida; liberar el resto
+        self._cap = found_caps[chosen]
+        for idx, cap in found_caps.items():
+            if idx != chosen:
+                cap.release()
+
+        print(f"[Kinect] Camara lista (OpenCV) -> indice {chosen}.")
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
