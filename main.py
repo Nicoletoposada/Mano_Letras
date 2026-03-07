@@ -54,11 +54,11 @@ KINECT_USB_LOCATION = "Port_#0003.Hub_#0002"  # ubicacion USB en Administrador d
 # Botones UI (interaccion mediante hover del dedo indice)
 DWELL_TIME_S   = 1.5 # segundos de hover para activar
 BTN_COOLDOWN_S = 1.5
-_BTN_W         = 162
-_BTN_H         = 48
+_BTN_W         = 130
+_BTN_H         = 36
 _BTN_X         = 12
-_COLOR_BTN_W   = 50
-_COLOR_BTN_GAP = 6
+_COLOR_BTN_W   = 40
+_COLOR_BTN_GAP = 5
 _BTN_DEFS      = [
     {"id": "toggle",  "y": 12},
     {"id": "clear",   "y": 12 + _BTN_H + 10},
