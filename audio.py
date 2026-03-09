@@ -1,7 +1,11 @@
 """
-audio.py  –  Modulo de sintesis de voz (edge-tts)
+audio.py  –  Modulo de sintesis de voz (Bark)
 Convierte un archivo .txt generado por el OCR en un .mp3 reproducible
-usando Microsoft Edge TTS (no requiere GPU ni modelos locales).
+usando el modelo generativo Bark (requiere GPU, modelos locales).
+
+Dependencias:
+    pip install bark scipy pydub
+    (pydub requiere ffmpeg en el PATH para exportar a MP3)
 
 Uso como modulo desde main.py:
     from audio import txt_a_mp3_async
@@ -10,15 +14,52 @@ Uso directo (linea de comandos):
     python audio.py ruta/al/texto.txt
 """
 
-import asyncio
+import gc
 import os
+import tempfile
 import threading
 from typing import Callable
 
+import numpy as np
+import torch
+from bark import SAMPLE_RATE, generate_audio, preload_models
+from scipy.io.wavfile import write as write_wav
+
 # ── Configuracion TTS ────────────────────────────────────────────────────────
-# Voces disponibles en espanol: es-ES-AlvaroNeural, es-ES-ElviraNeural,
-# es-MX-DaliaNeural, es-MX-JorgeNeural, etc.
-VOICE = "es-ES-AlvaroNeural"
+# Voces disponibles en espanol: v2/es_speaker_0 .. v2/es_speaker_9
+SPEAKER = "v2/es_speaker_6"
+
+# Tamanio de modelo: True = small (rapido), False = large (mayor calidad)
+USE_SMALL = True
+
+_models_loaded = False
+_models_lock   = threading.Lock()
+
+
+def _cargar_modelos() -> None:
+    """Carga los modelos de Bark una sola vez (thread-safe)."""
+    global _models_loaded
+    with _models_lock:
+        if _models_loaded:
+            return
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Parche necesario para versiones recientes de PyTorch
+        _orig = torch.load
+        torch.load = lambda *a, **kw: _orig(*a, **{**kw, "weights_only": False})
+
+        print("[Audio] Cargando modelos Bark (GPU)...")
+        preload_models(
+            text_use_small=USE_SMALL,
+            coarse_use_small=USE_SMALL,
+            fine_use_small=USE_SMALL,
+            text_use_gpu=True,
+        )
+
+        torch.load = _orig
+        _models_loaded = True
+        print("[Audio] Modelos listos.")
 
 
 def _leer_txt(txt_path: str) -> str:
@@ -28,15 +69,28 @@ def _leer_txt(txt_path: str) -> str:
     return " ".join(lineas)
 
 
-async def _generar_audio_async(
+def _wav_a_mp3(wav_path: str, mp3_path: str) -> None:
+    """Convierte un .wav a .mp3 llamando a ffmpeg directamente via subprocess."""
+    import subprocess
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg fallo (codigo {result.returncode}):\n"
+            + result.stderr.decode(errors="replace")
+        )
+
+
+def _generar_audio(
     txt_path: str,
     mp3_path: str,
     progress_cb: Callable[[float, str], None] | None = None,
 ) -> bool:
-    """Genera el .mp3 a partir del .txt usando edge-tts (async)."""
+    """Genera el .mp3 a partir del .txt usando Bark (sincrono)."""
     try:
-        import edge_tts
-
         if not os.path.exists(txt_path):
             print(f"[Audio] No existe el archivo: {txt_path}")
             return False
@@ -46,18 +100,39 @@ async def _generar_audio_async(
             print("[Audio] El .txt esta vacio, no se genera audio.")
             return False
 
-        print(f"[Audio] Sintetizando con edge-tts (voz: {VOICE})...")
         print(f"[Audio] Texto: {texto[:120]}{'...' if len(texto) > 120 else ''}")
 
         if progress_cb:
-            progress_cb(0.1, "Conectando con servicio TTS...")
+            progress_cb(0.05, "Cargando modelos Bark...")
 
-        communicate = edge_tts.Communicate(texto, VOICE)
+        _cargar_modelos()
 
         if progress_cb:
-            progress_cb(0.3, "Generando audio...")
+            progress_cb(0.3, "Generando audio con Bark...")
 
-        await communicate.save(mp3_path)
+        print(f"[Audio] Sintetizando con Bark (speaker: {SPEAKER})...")
+        with torch.no_grad():
+            audio_array = generate_audio(texto, history_prompt=SPEAKER)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if progress_cb:
+            progress_cb(0.8, "Convirtiendo a MP3...")
+
+        # Normalizar y guardar como WAV temporal, luego convertir a MP3
+        audio_norm = audio_array / (np.max(np.abs(audio_array)) + 1e-9)
+        audio_int16 = (audio_norm * 32767).astype(np.int16)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_tmp = tmp.name
+
+        try:
+            write_wav(wav_tmp, SAMPLE_RATE, audio_int16)
+            _wav_a_mp3(wav_tmp, mp3_path)
+        finally:
+            if os.path.exists(wav_tmp):
+                os.remove(wav_tmp)
 
         if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
             print(f"[Audio] MP3 guardado -> {mp3_path}")
@@ -72,15 +147,6 @@ async def _generar_audio_async(
         if progress_cb:
             progress_cb(-1.0, f"Error: {exc}")
         return False
-
-
-def _generar_audio(
-    txt_path: str,
-    mp3_path: str,
-    progress_cb: Callable[[float, str], None] | None = None,
-) -> bool:
-    """Wrapper sincrono sobre _generar_audio_async para usarlo desde hilos."""
-    return asyncio.run(_generar_audio_async(txt_path, mp3_path, progress_cb))
 
 
 def txt_a_mp3_async(
@@ -148,8 +214,8 @@ if __name__ == "__main__":
         print("Uso: python audio.py ruta/al/texto.txt [salida.mp3]")
         sys.exit(1)
 
-    _txt  = sys.argv[1]
-    _mp3  = sys.argv[2] if len(sys.argv) > 2 else _txt.replace(".txt", ".mp3")
+    _txt = sys.argv[1]
+    _mp3 = sys.argv[2] if len(sys.argv) > 2 else _txt.replace(".txt", ".mp3")
 
     def _cb(frac, msg):
         bar = int(frac * 30) if frac >= 0 else 0
