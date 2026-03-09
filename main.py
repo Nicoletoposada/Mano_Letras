@@ -61,13 +61,14 @@ _BTN_X         = 12
 _COLOR_BTN_W   = 40
 _COLOR_BTN_GAP = 5
 _BTN_DEFS      = [
-    {"id": "toggle",  "y": 12},
-    {"id": "clear",   "y": 12 + _BTN_H + 10},
-    {"id": "color_0", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X,                                   "w": _COLOR_BTN_W},
-    {"id": "color_1", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + _COLOR_BTN_W + _COLOR_BTN_GAP,   "w": _COLOR_BTN_W},
-    {"id": "color_2", "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + 2*(_COLOR_BTN_W+_COLOR_BTN_GAP), "w": _COLOR_BTN_W},
-    {"id": "guardar", "y": 12 + 3 * (_BTN_H + 10)},
-    {"id": "quit",    "y": 12 + 4 * (_BTN_H + 10)},
+    {"id": "toggle",     "y": 12},
+    {"id": "clear",      "y": 12 + _BTN_H + 10},
+    {"id": "color_0",   "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X,                                   "w": _COLOR_BTN_W},
+    {"id": "color_1",   "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + _COLOR_BTN_W + _COLOR_BTN_GAP,   "w": _COLOR_BTN_W},
+    {"id": "color_2",   "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + 2*(_COLOR_BTN_W+_COLOR_BTN_GAP), "w": _COLOR_BTN_W},
+    {"id": "guardar",   "y": 12 + 3 * (_BTN_H + 10)},
+    {"id": "reproducir","y": 12 + 4 * (_BTN_H + 10)},  # visible solo cuando audio_ready
+    {"id": "quit",      "y": 12 + 5 * (_BTN_H + 10)},
 ]
 
 # Constantes NUI API (Kinect SDK v1.8)
@@ -94,6 +95,23 @@ try:
 except ImportError:
     _EASYOCR_AVAILABLE = False
 _ocr_reader = None
+
+# Audio TTS (audio.py)
+try:
+    from audio import txt_a_mp3_async, reproducir_mp3
+    _AUDIO_AVAILABLE = True
+except ImportError:
+    _AUDIO_AVAILABLE = False
+
+# Estado compartido de progreso OCR / TTS
+# Las escrituras se hacen desde hilos de fondo; la lectura en el hilo principal
+_progress_lock       = threading.Lock()
+_ocr_progress: float = 0.0   # 0.0 a 1.0 (-1 = error)
+_ocr_msg: str        = ""
+_tts_progress: float = 0.0   # 0.0 a 1.0 (-1 = error)
+_tts_msg: str        = ""
+_audio_ready: bool   = False  # True cuando el mp3 ya existe y puede reproducirse
+_audio_path:  str    = ""     # ruta al .mp3 generado
 
 
 # Callback de MediaPipe (modo LIVE_STREAM)
@@ -744,16 +762,21 @@ def draw_ui_buttons(
     drawing_mode: bool,
     hover_prog: dict,
     color_idx: int = 0,
+    audio_ready: bool = False,
 ) -> np.ndarray:
     """Dibuja los botones UI sobre el frame con indicador de progreso de hover."""
     labels = {
-        "toggle":  "Lapiz: ON " if drawing_mode else "Lapiz: OFF",
-        "clear":   "Limpiar",
-        "guardar": "Guardar",
-        "quit":    "Salir",
+        "toggle":     "Lapiz: ON " if drawing_mode else "Lapiz: OFF",
+        "clear":      "Limpiar",
+        "guardar":    "Guardar",
+        "reproducir": "Reproducir",
+        "quit":       "Salir",
     }
     for btn in _BTN_DEFS:
         bid  = btn["id"]
+        # Boton Reproducir: solo visible cuando el audio esta listo
+        if bid == "reproducir" and not audio_ready:
+            continue
         bx   = btn.get("x", _BTN_X)
         bw   = btn.get("w", _BTN_W)
         x1, y1 = bx, btn["y"]
@@ -782,6 +805,26 @@ def draw_ui_buttons(
 
             if prog > 0:
                 center = (x1 + bw // 2, y1 + _BTN_H // 2)
+                cv2.circle(frame, center, 11, (80, 80, 80), 1, cv2.LINE_AA)
+                cv2.ellipse(frame, center, (11, 11), -90, 0, int(360 * prog),
+                            (60, 230, 60), 3, cv2.LINE_AA)
+            continue
+
+        # Boton Reproducir: color verdoso para destacarlo
+        if bid == "reproducir":
+            overlay = frame.copy()
+            bg = (30, 110, 30) if prog > 0 else (20, 70, 20)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), bg, -1)
+            cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+            border = (60, 255, 60) if prog > 0 else (80, 200, 80)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2, cv2.LINE_AA)
+            label = labels[bid]
+            (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 1)
+            tx = x1 + (bw - tw) // 2
+            ty = y1 + (_BTN_H + th) // 2
+            cv2.putText(frame, label, (tx, ty), FONT, 0.55, (60, 255, 60), 1, cv2.LINE_AA)
+            if prog > 0:
+                center = (x2 - 18, y1 + _BTN_H // 2)
                 cv2.circle(frame, center, 11, (80, 80, 80), 1, cv2.LINE_AA)
                 cv2.ellipse(frame, center, (11, 11), -90, 0, int(360 * prog),
                             (60, 230, 60), 3, cv2.LINE_AA)
@@ -829,37 +872,148 @@ def _get_ocr_reader():
 
 def save_snapshot(output_frame: np.ndarray, canvas: np.ndarray) -> None:
     """
-    Guarda `output_frame` como PNG y detecta el texto dibujado en `canvas`
-    con EasyOCR, guardando el resultado en un .txt.
-    El OCR se ejecuta en un hilo de fondo para no bloquear la UI.
+    Guarda `output_frame` como PNG, ejecuta OCR en hilo de fondo (actualizando
+    _ocr_progress) y luego lanza la sintesis TTS (actualizando _tts_progress).
+    Cuando el audio esta listo activa _audio_ready.
     """
+    global _ocr_progress, _ocr_msg, _tts_progress, _tts_msg, _audio_ready, _audio_path
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     img_path  = str(BASE_DIR / f"captura_{timestamp}.png")
     txt_path  = str(BASE_DIR / f"texto_{timestamp}.txt")
+    mp3_path  = str(BASE_DIR / f"audio_{timestamp}.mp3")
 
     cv2.imwrite(img_path, output_frame)
     print(f"[Guardar] Imagen -> {img_path}")
 
+    # Reiniciar barras
+    with _progress_lock:
+        _ocr_progress = 0.0
+        _ocr_msg      = "Iniciando OCR..."
+        _tts_progress = 0.0
+        _tts_msg      = ""
+        _audio_ready  = False
+        _audio_path   = ""
+
     canvas_copy = canvas.copy()
 
+    def _set_ocr(frac: float, msg: str) -> None:
+        global _ocr_progress, _ocr_msg
+        with _progress_lock:
+            _ocr_progress = frac
+            _ocr_msg      = msg
+
+    def _set_tts(frac: float, msg: str) -> None:
+        global _tts_progress, _tts_msg
+        with _progress_lock:
+            _tts_progress = frac
+            _tts_msg      = msg
+
     def _ocr_task():
+        global _audio_ready, _audio_path
+        _set_ocr(0.1, "Procesando imagen...")
         reader = _get_ocr_reader()
         if reader is not None:
+            _set_ocr(0.3, "Leyendo texto...")
             gray = cv2.cvtColor(canvas_copy, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-            # Dilatar levemente para engrosar trazos finos
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
             mask   = cv2.dilate(mask, kernel, iterations=1)
-            inv    = cv2.bitwise_not(mask)  # texto negro sobre fondo blanco
+            inv    = cv2.bitwise_not(mask)
             results = reader.readtext(inv, detail=0)
             text    = "\n".join(results) if results else "(Sin texto detectado)"
         else:
-            text = "(easyocr no instalado - ejecuta: pip install easyocr)"
+            text = "(easyocr no instalado)"
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write(text)
+        _set_ocr(1.0, "Texto guardado")
         print(f"[Guardar] Texto  -> {txt_path}")
 
+        # Lanzar TTS si audio disponible
+        if _AUDIO_AVAILABLE:
+            _set_tts(0.01, "Esperando sintesis...")
+
+            def _on_tts_done(ok: bool, ruta: str) -> None:
+                global _audio_ready, _audio_path
+                if ok:
+                    # La ruta puede haber cambiado a .wav si pydub no estaba
+                    ruta_real = ruta if os.path.exists(ruta) else ruta.replace(".mp3", ".wav")
+                    with _progress_lock:
+                        _audio_ready = True
+                        _audio_path  = ruta_real
+                    print(f"[Audio] Listo para reproducir: {ruta_real}")
+                else:
+                    _set_tts(-1.0, "Error en sintesis")
+
+            txt_a_mp3_async(txt_path, mp3_path, _set_tts, _on_tts_done)
+        else:
+            _set_tts(0.0, "")
+
     threading.Thread(target=_ocr_task, daemon=True).start()
+
+
+# ── Barras de progreso en pantalla ──────────────────────────────────────────
+
+def _draw_progress_bars(
+    frame: np.ndarray,
+    ocr_prog: float, ocr_msg: str,
+    tts_prog: float, tts_msg: str,
+) -> None:
+    """
+    Dibuja en la parte inferior del frame dos barras de progreso:
+      - Barra 1: progreso del OCR  (0-1; -1 = error)
+      - Barra 2: progreso del TTS  (0-1; -1 = error)
+    Solo se muestra si alguna barra esta en progreso (0 < prog < 1 o error).
+    """
+    BAR_W    = 360
+    BAR_H    = 14
+    BAR_X    = (FRAME_WIDTH - BAR_W) // 2
+    LABEL_SZ = 0.45
+    SPACING  = 38  # separacion entre las dos barras
+
+    bars = [
+        ("OCR",   ocr_prog, ocr_msg,  (0, 210, 255)),
+        ("Audio", tts_prog, tts_msg,  (60, 230, 60)),
+    ]
+
+    # Calcular si hay algo que mostrar
+    any_active = any(
+        (0.0 < p < 1.0) or p == -1.0
+        for _, p, _, _ in bars
+    )
+    if not any_active:
+        return
+
+    base_y = FRAME_HEIGHT - 10 - SPACING * len(bars)
+
+    for i, (tag, prog, msg, color) in enumerate(bars):
+        if prog == 0.0:
+            continue  # todavia no empezo, no mostrar
+
+        by = base_y + i * SPACING
+
+        # Fondo semitransparente
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (BAR_X - 2, by - 18), (BAR_X + BAR_W + 2, by + BAR_H + 4),
+                      (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+        # Riel de la barra
+        cv2.rectangle(frame, (BAR_X, by), (BAR_X + BAR_W, by + BAR_H), (70, 70, 70), -1)
+
+        if prog == -1.0:
+            # Error: barra roja
+            cv2.rectangle(frame, (BAR_X, by), (BAR_X + BAR_W, by + BAR_H), (0, 0, 200), -1)
+            etiqueta = f"{tag}: ERROR"
+        else:
+            fill = int(BAR_W * min(prog, 1.0))
+            if fill > 0:
+                cv2.rectangle(frame, (BAR_X, by), (BAR_X + fill, by + BAR_H), color, -1)
+            etiqueta = f"{tag}: {msg}  ({int(prog*100)}%)"
+
+        cv2.rectangle(frame, (BAR_X, by), (BAR_X + BAR_W, by + BAR_H), (140, 140, 140), 1)
+        cv2.putText(frame, etiqueta, (BAR_X, by - 4),
+                    FONT, LABEL_SZ, COLOR_WHITE, 1, cv2.LINE_AA)
 
 
 # Bucle principal
@@ -909,6 +1063,13 @@ def main():
     hover_start:    dict = {} # btn_id -> timestamp inicio hover
     hover_prog:     dict = {} # btn_id -> fraccion 0.0..1.0
     last_activated: dict = {} # btn_id -> timestamp de la ultima activacion
+
+    # Cache local de progreso (leidos del estado global en cada frame)
+    _local_ocr_prog  = 0.0
+    _local_ocr_msg   = ""
+    _local_tts_prog  = 0.0
+    _local_tts_msg   = ""
+    _local_audio_rdy = False
 
     cv2.namedWindow("Kinect - Gestos", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Kinect - Gestos", FRAME_WIDTH, FRAME_HEIGHT)
@@ -1006,12 +1167,26 @@ def main():
                 color_idx = int(action[-1])
             elif action == "guardar":
                 pending_save = True
+            elif action == "reproducir":
+                with _progress_lock:
+                    _ruta = _audio_path
+                if _ruta and _AUDIO_AVAILABLE:
+                    reproducir_mp3(_ruta)
             elif action == "quit":
                 quit_flag = True
 
+            # Leer estado de progreso desde los hilos de fondo
+            with _progress_lock:
+                _local_ocr_prog  = _ocr_progress
+                _local_ocr_msg   = _ocr_msg
+                _local_tts_prog  = _tts_progress
+                _local_tts_msg   = _tts_msg
+                _local_audio_rdy = _audio_ready
+
             output = draw_results(frame.copy(), snap)
             output = cv2.add(output, drawing_canvas)
-            output = draw_ui_buttons(output, drawing_mode, hover_prog, color_idx)
+            output = draw_ui_buttons(output, drawing_mode, hover_prog, color_idx,
+                                     audio_ready=_local_audio_rdy)
 
             # Guardar snapshot despues de renderizar para incluir todo
             if pending_save:
@@ -1030,6 +1205,10 @@ def main():
                               (sx + tw + 12, sy + 10), COLOR_BLACK, -1)
                 cv2.putText(output, save_msg, (sx, sy),
                             FONT, 0.9, COLOR_GREEN, 2, cv2.LINE_AA)
+
+            # ── Barras de progreso OCR y TTS ─────────────────────────────────
+            _draw_progress_bars(output, _local_ocr_prog, _local_ocr_msg,
+                                         _local_tts_prog, _local_tts_msg)
 
             cv2.putText(
                 output,
