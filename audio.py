@@ -1,6 +1,7 @@
 """
-audio.py  –  Modulo de sintesis de voz (Bark TTS)
-Convierte un archivo .txt generado por el OCR en un .mp3 reproducible.
+audio.py  –  Modulo de sintesis de voz (edge-tts)
+Convierte un archivo .txt generado por el OCR en un .mp3 reproducible
+usando Microsoft Edge TTS (no requiere GPU ni modelos locales).
 
 Uso como modulo desde main.py:
     from audio import txt_a_mp3_async
@@ -9,78 +10,68 @@ Uso directo (linea de comandos):
     python audio.py ruta/al/texto.txt
 """
 
-import gc
+import asyncio
 import os
 import threading
-from pathlib import Path
 from typing import Callable
 
-import numpy as np
-
 # ── Configuracion TTS ────────────────────────────────────────────────────────
-SPEAKER       = "v2/es_speaker_6"
-# TTS de frases largas: las divide en fragmentos de este tamaño (caracteres)
-MAX_CHARS_PER_CHUNK = 180
+# Voces disponibles en espanol: es-ES-AlvaroNeural, es-ES-ElviraNeural,
+# es-MX-DaliaNeural, es-MX-JorgeNeural, etc.
+VOICE = "es-ES-AlvaroNeural"
 
 
-# ── Estado del modelo Bark (carga perezosa) ──────────────────────────────────
-_bark_loaded  = False
-_bark_lock    = threading.Lock()
-
-
-def _ensure_bark(progress_cb: Callable[[float, str], None] | None = None) -> bool:
-    """Carga el modelo Bark la primera vez (thread-safe). Devuelve True si OK."""
-    global _bark_loaded
-    with _bark_lock:
-        if _bark_loaded:
-            return True
-        try:
-            import torch
-            from bark import preload_models
-
-            if progress_cb:
-                progress_cb(0.05, "Cargando modelo Bark...")
-
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Guardar y parchar torch.load para compatibilidad de pesos
-            _orig = torch.load
-            torch.load = lambda *a, **kw: _orig(*a, **{**kw, "weights_only": False})
-            preload_models(
-                text_use_small=True,
-                coarse_use_small=True,
-                fine_use_small=True,
-                text_use_gpu=True,
-            )
-            torch.load = _orig
-            _bark_loaded = True
-            if progress_cb:
-                progress_cb(0.15, "Modelo Bark listo.")
-            return True
-        except Exception as exc:
-            print(f"[Audio] Error cargando Bark: {exc}")
-            return False
-
-
-def _leer_txt(txt_path: str) -> list[str]:
-    """Lee el .txt y devuelve lista de fragmentos no vacíos."""
+def _leer_txt(txt_path: str) -> str:
+    """Lee el .txt y devuelve el contenido como una sola cadena."""
     with open(txt_path, "r", encoding="utf-8") as f:
         lineas = [l.strip() for l in f if l.strip()]
+    return " ".join(lineas)
 
-    # Dividir lineas largas en fragmentos de MAX_CHARS_PER_CHUNK caracteres
-    chunks: list[str] = []
-    for linea in lineas:
-        while len(linea) > MAX_CHARS_PER_CHUNK:
-            # Cortar en el ultimo espacio dentro del limite
-            corte = linea.rfind(" ", 0, MAX_CHARS_PER_CHUNK)
-            if corte == -1:
-                corte = MAX_CHARS_PER_CHUNK
-            chunks.append(linea[:corte])
-            linea = linea[corte:].strip()
-        if linea:
-            chunks.append(linea)
-    return chunks
+
+async def _generar_audio_async(
+    txt_path: str,
+    mp3_path: str,
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> bool:
+    """Genera el .mp3 a partir del .txt usando edge-tts (async)."""
+    try:
+        import edge_tts
+
+        if not os.path.exists(txt_path):
+            print(f"[Audio] No existe el archivo: {txt_path}")
+            return False
+
+        texto = _leer_txt(txt_path)
+        if not texto:
+            print("[Audio] El .txt esta vacio, no se genera audio.")
+            return False
+
+        print(f"[Audio] Sintetizando con edge-tts (voz: {VOICE})...")
+        print(f"[Audio] Texto: {texto[:120]}{'...' if len(texto) > 120 else ''}")
+
+        if progress_cb:
+            progress_cb(0.1, "Conectando con servicio TTS...")
+
+        communicate = edge_tts.Communicate(texto, VOICE)
+
+        if progress_cb:
+            progress_cb(0.3, "Generando audio...")
+
+        await communicate.save(mp3_path)
+
+        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+            print(f"[Audio] MP3 guardado -> {mp3_path}")
+            if progress_cb:
+                progress_cb(1.0, "Audio listo!")
+            return True
+        else:
+            raise RuntimeError("El archivo MP3 generado esta vacio o no existe.")
+
+    except Exception as exc:
+        print(f"[Audio] Error general: {exc}")
+        if progress_cb:
+            progress_cb(-1.0, f"Error: {exc}")
+        return False
 
 
 def _generar_audio(
@@ -88,83 +79,8 @@ def _generar_audio(
     mp3_path: str,
     progress_cb: Callable[[float, str], None] | None = None,
 ) -> bool:
-    """
-    Genera el .mp3 a partir del .txt.
-    progress_cb(fraccion 0.0-1.0, mensaje):  llamado en el hilo de trabajo.
-    Devuelve True si el archivo se creo correctamente.
-    """
-    try:
-        import torch
-        from bark import SAMPLE_RATE, generate_audio
-        from scipy.io.wavfile import write as write_wav
-
-        if not _ensure_bark(progress_cb):
-            return False
-
-        if not os.path.exists(txt_path):
-            print(f"[Audio] No existe el archivo: {txt_path}")
-            return False
-
-        chunks = _leer_txt(txt_path)
-        if not chunks:
-            print("[Audio] El .txt esta vacio, no se genera audio.")
-            return False
-
-        total   = len(chunks)
-        partes: list[np.ndarray] = []
-
-        for i, texto in enumerate(chunks):
-            frac_base = 0.15 + 0.80 * (i / total)
-            if progress_cb:
-                progress_cb(frac_base, f"Sintetizando {i+1}/{total}...")
-
-            prompt = f"♪ {texto} ♪"
-            print(f"[Audio] [{i+1}/{total}] {texto}")
-            try:
-                with torch.no_grad():
-                    chunk = generate_audio(prompt, history_prompt=SPEAKER, text_temp=0.5)
-                partes.append(chunk)
-            except Exception as exc:
-                print(f"[Audio] Error en fragmento {i+1}: {exc}")
-            finally:
-                gc.collect()
-                torch.cuda.empty_cache()
-
-        if not partes:
-            return False
-
-        audio = np.concatenate(partes)
-        audio = audio / (np.max(np.abs(audio)) + 1e-9)
-        audio_i16 = (audio * 32767).astype(np.int16)
-
-        # Guardar WAV temporal y convertir a MP3 con pydub/ffmpeg
-        wav_tmp = mp3_path.replace(".mp3", "_tmp.wav")
-        write_wav(wav_tmp, SAMPLE_RATE, audio_i16)
-
-        try:
-            from pydub import AudioSegment
-            seg = AudioSegment.from_wav(wav_tmp)
-            seg.export(mp3_path, format="mp3", bitrate="128k")
-            os.remove(wav_tmp)
-            print(f"[Audio] MP3 guardado -> {mp3_path}")
-        except Exception:
-            # pydub/ffmpeg no disponible: dejar WAV renombrado
-            import shutil
-            wav_final = mp3_path.replace(".mp3", ".wav")
-            shutil.move(wav_tmp, wav_final)
-            print(f"[Audio] (pydub no disponible) WAV guardado -> {wav_final}")
-            # Actualizar la ruta que devuelve para que main.py use la correcta
-            mp3_path = wav_final
-
-        if progress_cb:
-            progress_cb(1.0, "Audio listo!")
-        return True
-
-    except Exception as exc:
-        print(f"[Audio] Error general: {exc}")
-        if progress_cb:
-            progress_cb(-1.0, f"Error: {exc}")
-        return False
+    """Wrapper sincrono sobre _generar_audio_async para usarlo desde hilos."""
+    return asyncio.run(_generar_audio_async(txt_path, mp3_path, progress_cb))
 
 
 def txt_a_mp3_async(
