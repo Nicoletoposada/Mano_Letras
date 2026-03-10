@@ -60,15 +60,17 @@ _BTN_H         = 36
 _BTN_X         = 12
 _COLOR_BTN_W   = 40
 _COLOR_BTN_GAP = 5
+_REPR_BTN_W    = (_BTN_W - 6) // 2   # ancho de cada boton de voz (mujer/hombre)
 _BTN_DEFS      = [
     {"id": "toggle",     "y": 12},
     {"id": "clear",      "y": 12 + _BTN_H + 10},
     {"id": "color_0",   "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X,                                   "w": _COLOR_BTN_W},
     {"id": "color_1",   "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + _COLOR_BTN_W + _COLOR_BTN_GAP,   "w": _COLOR_BTN_W},
     {"id": "color_2",   "y": 12 + 2 * (_BTN_H + 10), "x": _BTN_X + 2*(_COLOR_BTN_W+_COLOR_BTN_GAP), "w": _COLOR_BTN_W},
-    {"id": "guardar",   "y": 12 + 3 * (_BTN_H + 10)},
-    {"id": "reproducir","y": 12 + 4 * (_BTN_H + 10)},  # visible solo cuando audio_ready
-    {"id": "quit",      "y": 12 + 5 * (_BTN_H + 10)},
+    {"id": "guardar",      "y": 12 + 3 * (_BTN_H + 10)},
+    {"id": "repr_mujer",   "y": 12 + 4 * (_BTN_H + 10), "x": _BTN_X,                    "w": _REPR_BTN_W},  # visible solo cuando audio_ready_mujer
+    {"id": "repr_hombre",  "y": 12 + 4 * (_BTN_H + 10), "x": _BTN_X + _REPR_BTN_W + 6,  "w": _REPR_BTN_W},  # visible solo cuando audio_ready_hombre
+    {"id": "quit",         "y": 12 + 5 * (_BTN_H + 10)},
 ]
 
 # Constantes NUI API (Kinect SDK v1.8)
@@ -98,20 +100,24 @@ _ocr_reader = None
 
 # Audio TTS (audio.py)
 try:
-    from audio import txt_a_mp3_async, reproducir_mp3
+    from audio import txt_a_mp3_async, reproducir_mp3, _generar_audio, SPEAKER_MUJER, SPEAKER_HOMBRE
     _AUDIO_AVAILABLE = True
 except ImportError:
     _AUDIO_AVAILABLE = False
 
 # Estado compartido de progreso OCR / TTS
 # Las escrituras se hacen desde hilos de fondo; la lectura en el hilo principal
-_progress_lock       = threading.Lock()
-_ocr_progress: float = 0.0   # 0.0 a 1.0 (-1 = error)
-_ocr_msg: str        = ""
-_tts_progress: float = 0.0   # 0.0 a 1.0 (-1 = error)
-_tts_msg: str        = ""
-_audio_ready: bool   = False  # True cuando el mp3 ya existe y puede reproducirse
-_audio_path:  str    = ""     # ruta al .mp3 generado
+_progress_lock        = threading.Lock()
+_ocr_progress: float  = 0.0   # 0.0 a 1.0 (-1 = error)
+_ocr_msg: str         = ""
+_tts_progress_mujer:  float = 0.0   # progreso TTS voz femenina
+_tts_msg_mujer:       str   = ""
+_tts_progress_hombre: float = 0.0   # progreso TTS voz masculina
+_tts_msg_hombre:      str   = ""
+_audio_ready_mujer:   bool  = False  # True cuando el mp3 de voz femenina esta listo
+_audio_ready_hombre:  bool  = False  # True cuando el mp3 de voz masculina esta listo
+_audio_path_mujer:    str   = ""     # ruta al .mp3 de voz femenina
+_audio_path_hombre:   str   = ""     # ruta al .mp3 de voz masculina
 
 
 # Callback de MediaPipe (modo LIVE_STREAM)
@@ -762,20 +768,24 @@ def draw_ui_buttons(
     drawing_mode: bool,
     hover_prog: dict,
     color_idx: int = 0,
-    audio_ready: bool = False,
+    audio_ready_mujer: bool = False,
+    audio_ready_hombre: bool = False,
 ) -> np.ndarray:
     """Dibuja los botones UI sobre el frame con indicador de progreso de hover."""
     labels = {
-        "toggle":     "Lapiz: ON " if drawing_mode else "Lapiz: OFF",
-        "clear":      "Limpiar",
-        "guardar":    "Guardar",
-        "reproducir": "Reproducir",
-        "quit":       "Salir",
+        "toggle":      "Lapiz: ON " if drawing_mode else "Lapiz: OFF",
+        "clear":       "Limpiar",
+        "guardar":     "Guardar",
+        "repr_mujer":  "Mujer",
+        "repr_hombre": "Hombre",
+        "quit":        "Salir",
     }
     for btn in _BTN_DEFS:
         bid  = btn["id"]
-        # Boton Reproducir: solo visible cuando el audio esta listo
-        if bid == "reproducir" and not audio_ready:
+        # Botones de voz: solo visibles cuando su audio esta listo
+        if bid == "repr_mujer" and not audio_ready_mujer:
+            continue
+        if bid == "repr_hombre" and not audio_ready_hombre:
             continue
         bx   = btn.get("x", _BTN_X)
         bw   = btn.get("w", _BTN_W)
@@ -810,24 +820,31 @@ def draw_ui_buttons(
                             (60, 230, 60), 3, cv2.LINE_AA)
             continue
 
-        # Boton Reproducir: color verdoso para destacarlo
-        if bid == "reproducir":
+        # Botones de voz: repr_mujer (violeta) y repr_hombre (azul)
+        if bid in ("repr_mujer", "repr_hombre"):
+            is_mujer = (bid == "repr_mujer")
+            if is_mujer:
+                bg_color   = (80, 30, 100)  if prog > 0 else (50, 15, 70)
+                border_clr = (180, 80, 255) if prog > 0 else (120, 50, 180)
+                txt_clr    = (220, 130, 255)
+            else:
+                bg_color   = (100, 60, 20)  if prog > 0 else (65, 35, 10)
+                border_clr = (255, 155, 60) if prog > 0 else (180, 100, 35)
+                txt_clr    = (255, 190, 110)
             overlay = frame.copy()
-            bg = (30, 110, 30) if prog > 0 else (20, 70, 20)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), bg, -1)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), bg_color, -1)
             cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-            border = (60, 255, 60) if prog > 0 else (80, 200, 80)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2, cv2.LINE_AA)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), border_clr, 2, cv2.LINE_AA)
             label = labels[bid]
-            (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 1)
+            (tw, th), _ = cv2.getTextSize(label, FONT, 0.42, 1)
             tx = x1 + (bw - tw) // 2
             ty = y1 + (_BTN_H + th) // 2
-            cv2.putText(frame, label, (tx, ty), FONT, 0.55, (60, 255, 60), 1, cv2.LINE_AA)
+            cv2.putText(frame, label, (tx, ty), FONT, 0.42, txt_clr, 1, cv2.LINE_AA)
             if prog > 0:
-                center = (x2 - 18, y1 + _BTN_H // 2)
-                cv2.circle(frame, center, 11, (80, 80, 80), 1, cv2.LINE_AA)
-                cv2.ellipse(frame, center, (11, 11), -90, 0, int(360 * prog),
-                            (60, 230, 60), 3, cv2.LINE_AA)
+                center = (x2 - 10, y1 + _BTN_H // 2)
+                cv2.circle(frame, center, 8, (80, 80, 80), 1, cv2.LINE_AA)
+                cv2.ellipse(frame, center, (8, 8), -90, 0, int(360 * prog),
+                            border_clr, 2, cv2.LINE_AA)
             continue
 
         # Botones normales
@@ -872,28 +889,40 @@ def _get_ocr_reader():
 
 def save_snapshot(output_frame: np.ndarray, canvas: np.ndarray) -> None:
     """
-    Guarda `output_frame` como PNG, ejecuta OCR en hilo de fondo (actualizando
-    _ocr_progress) y luego lanza la sintesis TTS (actualizando _tts_progress).
-    Cuando el audio esta listo activa _audio_ready.
+    Genera un unico archivo de imagen (PNG) y un unico archivo de texto (OCR),
+    y a partir de ese texto produce DOS archivos de audio: uno con voz femenina
+    y otro con voz masculina.
+      captura_TIMESTAMP.png       <- imagen del frame con el canvas dibujado
+      texto_TIMESTAMP.txt         <- texto extraido por OCR
+      audio_mujer_TIMESTAMP.mp3   <- TTS voz femenina
+      audio_hombre_TIMESTAMP.mp3  <- TTS voz masculina
     """
-    global _ocr_progress, _ocr_msg, _tts_progress, _tts_msg, _audio_ready, _audio_path
+    global _ocr_progress, _ocr_msg, _tts_progress_mujer, _tts_msg_mujer, \
+           _tts_progress_hombre, _tts_msg_hombre, \
+           _audio_ready_mujer, _audio_ready_hombre, \
+           _audio_path_mujer, _audio_path_hombre
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    img_path  = str(BASE_DIR / f"captura_{timestamp}.png")
-    txt_path  = str(BASE_DIR / f"texto_{timestamp}.txt")
-    mp3_path  = str(BASE_DIR / f"audio_{timestamp}.mp3")
+    timestamp      = time.strftime("%Y%m%d_%H%M%S")
+    img_path       = str(BASE_DIR / f"captura_{timestamp}.png")
+    txt_path       = str(BASE_DIR / f"texto_{timestamp}.txt")
+    mp3_path_mujer  = str(BASE_DIR / f"audio_mujer_{timestamp}.mp3")
+    mp3_path_hombre = str(BASE_DIR / f"audio_hombre_{timestamp}.mp3")
 
     cv2.imwrite(img_path, output_frame)
     print(f"[Guardar] Imagen -> {img_path}")
 
     # Reiniciar barras
     with _progress_lock:
-        _ocr_progress = 0.0
-        _ocr_msg      = "Iniciando OCR..."
-        _tts_progress = 0.0
-        _tts_msg      = ""
-        _audio_ready  = False
-        _audio_path   = ""
+        _ocr_progress        = 0.0
+        _ocr_msg             = "Iniciando OCR..."
+        _tts_progress_mujer  = 0.0
+        _tts_msg_mujer       = ""
+        _tts_progress_hombre = 0.0
+        _tts_msg_hombre      = ""
+        _audio_ready_mujer   = False
+        _audio_ready_hombre  = False
+        _audio_path_mujer    = ""
+        _audio_path_hombre   = ""
 
     canvas_copy = canvas.copy()
 
@@ -903,14 +932,20 @@ def save_snapshot(output_frame: np.ndarray, canvas: np.ndarray) -> None:
             _ocr_progress = frac
             _ocr_msg      = msg
 
-    def _set_tts(frac: float, msg: str) -> None:
-        global _tts_progress, _tts_msg
+    def _set_tts_mujer(frac: float, msg: str) -> None:
+        global _tts_progress_mujer, _tts_msg_mujer
         with _progress_lock:
-            _tts_progress = frac
-            _tts_msg      = msg
+            _tts_progress_mujer = frac
+            _tts_msg_mujer      = msg
+
+    def _set_tts_hombre(frac: float, msg: str) -> None:
+        global _tts_progress_hombre, _tts_msg_hombre
+        with _progress_lock:
+            _tts_progress_hombre = frac
+            _tts_msg_hombre      = msg
 
     def _ocr_task():
-        global _audio_ready, _audio_path
+        global _audio_ready_mujer, _audio_path_mujer, _audio_ready_hombre, _audio_path_hombre
         _set_ocr(0.1, "Procesando imagen...")
         reader = _get_ocr_reader()
         if reader is not None:
@@ -929,25 +964,34 @@ def save_snapshot(output_frame: np.ndarray, canvas: np.ndarray) -> None:
         _set_ocr(1.0, "Texto guardado")
         print(f"[Guardar] Texto  -> {txt_path}")
 
-        # Lanzar TTS si audio disponible
+        # Generar audio secuencialmente (mujer primero, luego hombre)
+        # para no saturar la GPU con dos generaciones paralelas.
         if _AUDIO_AVAILABLE:
-            _set_tts(0.01, "Esperando sintesis...")
+            # ── Voz femenina ────────────────────────────────────────────────
+            _set_tts_mujer(0.01, "Generando voz mujer...")
+            ok_m = _generar_audio(txt_path, mp3_path_mujer, _set_tts_mujer, SPEAKER_MUJER)
+            if ok_m:
+                ruta_m = (mp3_path_mujer if os.path.exists(mp3_path_mujer)
+                          else mp3_path_mujer.replace(".mp3", ".wav"))
+                with _progress_lock:
+                    _audio_ready_mujer = True
+                    _audio_path_mujer  = ruta_m
+                print(f"[Audio] Voz mujer lista: {ruta_m}")
+            else:
+                _set_tts_mujer(-1.0, "Error voz mujer")
 
-            def _on_tts_done(ok: bool, ruta: str) -> None:
-                global _audio_ready, _audio_path
-                if ok:
-                    # La ruta puede haber cambiado a .wav si pydub no estaba
-                    ruta_real = ruta if os.path.exists(ruta) else ruta.replace(".mp3", ".wav")
-                    with _progress_lock:
-                        _audio_ready = True
-                        _audio_path  = ruta_real
-                    print(f"[Audio] Listo para reproducir: {ruta_real}")
-                else:
-                    _set_tts(-1.0, "Error en sintesis")
-
-            txt_a_mp3_async(txt_path, mp3_path, _set_tts, _on_tts_done)
-        else:
-            _set_tts(0.0, "")
+            # ── Voz masculina ───────────────────────────────────────────────
+            _set_tts_hombre(0.01, "Generando voz hombre...")
+            ok_h = _generar_audio(txt_path, mp3_path_hombre, _set_tts_hombre, SPEAKER_HOMBRE)
+            if ok_h:
+                ruta_h = (mp3_path_hombre if os.path.exists(mp3_path_hombre)
+                          else mp3_path_hombre.replace(".mp3", ".wav"))
+                with _progress_lock:
+                    _audio_ready_hombre = True
+                    _audio_path_hombre  = ruta_h
+                print(f"[Audio] Voz hombre lista: {ruta_h}")
+            else:
+                _set_tts_hombre(-1.0, "Error voz hombre")
 
     threading.Thread(target=_ocr_task, daemon=True).start()
 
@@ -957,23 +1001,26 @@ def save_snapshot(output_frame: np.ndarray, canvas: np.ndarray) -> None:
 def _draw_progress_bars(
     frame: np.ndarray,
     ocr_prog: float, ocr_msg: str,
-    tts_prog: float, tts_msg: str,
+    tts_prog_m: float, tts_msg_m: str,
+    tts_prog_h: float, tts_msg_h: str,
 ) -> None:
     """
-    Dibuja en la parte inferior del frame dos barras de progreso:
-      - Barra 1: progreso del OCR  (0-1; -1 = error)
-      - Barra 2: progreso del TTS  (0-1; -1 = error)
+    Dibuja en la parte inferior del frame barras de progreso:
+      - Barra OCR
+      - Barra Voz Mujer
+      - Barra Voz Hombre
     Solo se muestra si alguna barra esta en progreso (0 < prog < 1 o error).
     """
     BAR_W    = 360
     BAR_H    = 14
     BAR_X    = (FRAME_WIDTH - BAR_W) // 2
     LABEL_SZ = 0.45
-    SPACING  = 38  # separacion entre las dos barras
+    SPACING  = 38  # separacion entre barras
 
     bars = [
-        ("OCR",   ocr_prog, ocr_msg,  (0, 210, 255)),
-        ("Audio", tts_prog, tts_msg,  (60, 230, 60)),
+        ("OCR",        ocr_prog,  ocr_msg,   (0, 210, 255)),
+        ("Voz Mujer",  tts_prog_m, tts_msg_m, (200, 100, 255)),
+        ("Voz Hombre", tts_prog_h, tts_msg_h, (255, 180, 60)),
     ]
 
     # Calcular si hay algo que mostrar
@@ -1065,11 +1112,14 @@ def main():
     last_activated: dict = {} # btn_id -> timestamp de la ultima activacion
 
     # Cache local de progreso (leidos del estado global en cada frame)
-    _local_ocr_prog  = 0.0
-    _local_ocr_msg   = ""
-    _local_tts_prog  = 0.0
-    _local_tts_msg   = ""
-    _local_audio_rdy = False
+    _local_ocr_prog   = 0.0
+    _local_ocr_msg    = ""
+    _local_tts_prog_m = 0.0
+    _local_tts_msg_m  = ""
+    _local_tts_prog_h = 0.0
+    _local_tts_msg_h  = ""
+    _local_audio_rdy_m = False
+    _local_audio_rdy_h = False
 
     cv2.namedWindow("Kinect - Gestos", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Kinect - Gestos", FRAME_WIDTH, FRAME_HEIGHT)
@@ -1086,7 +1136,7 @@ def main():
             if BRIGHTNESS_BETA != 0:
                 frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=BRIGHTNESS_BETA)
 
-            #frame = cv2.flip(frame, 1) # modo espejo (flip horizontal)
+            #frame = cv2.flip(frame, 1) # modo espejo (Activo con camara de PC)
 
             rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_img   = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -1167,9 +1217,14 @@ def main():
                 color_idx = int(action[-1])
             elif action == "guardar":
                 pending_save = True
-            elif action == "reproducir":
+            elif action == "repr_mujer":
                 with _progress_lock:
-                    _ruta = _audio_path
+                    _ruta = _audio_path_mujer
+                if _ruta and _AUDIO_AVAILABLE:
+                    reproducir_mp3(_ruta)
+            elif action == "repr_hombre":
+                with _progress_lock:
+                    _ruta = _audio_path_hombre
                 if _ruta and _AUDIO_AVAILABLE:
                     reproducir_mp3(_ruta)
             elif action == "quit":
@@ -1177,16 +1232,20 @@ def main():
 
             # Leer estado de progreso desde los hilos de fondo
             with _progress_lock:
-                _local_ocr_prog  = _ocr_progress
-                _local_ocr_msg   = _ocr_msg
-                _local_tts_prog  = _tts_progress
-                _local_tts_msg   = _tts_msg
-                _local_audio_rdy = _audio_ready
+                _local_ocr_prog    = _ocr_progress
+                _local_ocr_msg     = _ocr_msg
+                _local_tts_prog_m  = _tts_progress_mujer
+                _local_tts_msg_m   = _tts_msg_mujer
+                _local_tts_prog_h  = _tts_progress_hombre
+                _local_tts_msg_h   = _tts_msg_hombre
+                _local_audio_rdy_m = _audio_ready_mujer
+                _local_audio_rdy_h = _audio_ready_hombre
 
             output = draw_results(frame.copy(), snap)
             output = cv2.add(output, drawing_canvas)
             output = draw_ui_buttons(output, drawing_mode, hover_prog, color_idx,
-                                     audio_ready=_local_audio_rdy)
+                                     audio_ready_mujer=_local_audio_rdy_m,
+                                     audio_ready_hombre=_local_audio_rdy_h)
 
             # Guardar snapshot despues de renderizar para incluir todo
             if pending_save:
@@ -1208,7 +1267,8 @@ def main():
 
             # ── Barras de progreso OCR y TTS ─────────────────────────────────
             _draw_progress_bars(output, _local_ocr_prog, _local_ocr_msg,
-                                         _local_tts_prog, _local_tts_msg)
+                                _local_tts_prog_m, _local_tts_msg_m,
+                                _local_tts_prog_h, _local_tts_msg_h)
 
             cv2.putText(
                 output,

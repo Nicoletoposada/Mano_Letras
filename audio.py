@@ -1,66 +1,43 @@
 """
-audio.py  –  Modulo de sintesis de voz (Bark)
-Convierte un archivo .txt generado por el OCR en un .mp3 reproducible
-usando el modelo generativo Bark (requiere GPU, modelos locales).
+audio.py  -  Modulo de sintesis de voz (Microsoft Edge TTS - Neural)
+
+Genera audio de alta calidad en espanol usando las voces neurales de
+Microsoft Edge TTS. No requiere GPU ni modelos locales pesados.
+Requiere conexion a internet.
 
 Dependencias:
-    pip install bark scipy pydub
-    (pydub requiere ffmpeg en el PATH para exportar a MP3)
+    pip install edge-tts          (ya incluido si usas una .venv reciente)
 
-Uso como modulo desde main.py:
-    from audio import txt_a_mp3_async
+Uso como modulo:
+    from audio import _generar_audio, SPEAKER_MUJER, SPEAKER_HOMBRE
 
-Uso directo (linea de comandos):
-    python audio.py ruta/al/texto.txt
+Uso directo:
+    python audio.py ruta/al/texto.txt [salida.mp3] [mujer|hombre]
 """
 
-import gc
+import asyncio
 import os
-import tempfile
 import threading
+from pathlib import Path
 from typing import Callable
 
-import numpy as np
-import torch
-from bark import SAMPLE_RATE, generate_audio, preload_models
-from scipy.io.wavfile import write as write_wav
+BASE_DIR = Path(__file__).parent
 
-# ── Configuracion TTS ────────────────────────────────────────────────────────
-# Voces disponibles en espanol: v2/es_speaker_0 .. v2/es_speaker_9
-SPEAKER = "v2/es_speaker_6"
+# ── Configuracion de voces ───────────────────────────────────────────────────
+# Voces neurales de alta calidad de Microsoft Edge TTS
+SPEAKER_MUJER  = "es-ES-ElviraNeural"   # mujer,  espanol de Espana
+SPEAKER_HOMBRE = "es-ES-AlvaroNeural"   # hombre, espanol de Espana
+SPEAKER        = SPEAKER_HOMBRE         # alias de compatibilidad
 
-# Tamanio de modelo: True = small (rapido), False = large (mayor calidad)
-USE_SMALL = True
+# Ajustes de prosodia (Edge TTS SSML rates/pitch/volume)
+# Formato: "+10%", "-5%", "+0%"  |  para pitch: "+5Hz", "-3Hz", "+0Hz"
+VOICE_RATE_MUJER   = "+0%"    # velocidad de habla  (mujer)
+VOICE_RATE_HOMBRE  = "-5%"    # un poco mas lento para voz masculina
+VOICE_PITCH_MUJER  = "+0Hz"   # tono base
+VOICE_PITCH_HOMBRE = "-5Hz"   # tono ligeramente mas grave
 
-_models_loaded = False
-_models_lock   = threading.Lock()
 
-
-def _cargar_modelos() -> None:
-    """Carga los modelos de Bark una sola vez (thread-safe)."""
-    global _models_loaded
-    with _models_lock:
-        if _models_loaded:
-            return
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Parche necesario para versiones recientes de PyTorch
-        _orig = torch.load
-        torch.load = lambda *a, **kw: _orig(*a, **{**kw, "weights_only": False})
-
-        print("[Audio] Cargando modelos Bark (GPU)...")
-        preload_models(
-            text_use_small=USE_SMALL,
-            coarse_use_small=USE_SMALL,
-            fine_use_small=USE_SMALL,
-            text_use_gpu=True,
-        )
-
-        torch.load = _orig
-        _models_loaded = True
-        print("[Audio] Modelos listos.")
-
+# ── Helpers internos ─────────────────────────────────────────────────────────
 
 def _leer_txt(txt_path: str) -> str:
     """Lee el .txt y devuelve el contenido como una sola cadena."""
@@ -69,27 +46,41 @@ def _leer_txt(txt_path: str) -> str:
     return " ".join(lineas)
 
 
-def _wav_a_mp3(wav_path: str, mp3_path: str) -> None:
-    """Convierte un .wav a .mp3 llamando a ffmpeg directamente via subprocess."""
-    import subprocess
-    result = subprocess.run(
-        ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg fallo (codigo {result.returncode}):\n"
-            + result.stderr.decode(errors="replace")
-        )
+def _run_coro(coro):
+    """Ejecuta una corrutina asyncio de forma segura desde un hilo sincrono."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        # Si asyncio.run falla (loop ya existente en el hilo), crear uno nuevo
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
+
+# ── Generacion principal ─────────────────────────────────────────────────────
 
 def _generar_audio(
     txt_path: str,
     mp3_path: str,
     progress_cb: Callable[[float, str], None] | None = None,
+    speaker: str = SPEAKER_HOMBRE,
 ) -> bool:
-    """Genera el .mp3 a partir del .txt usando Bark (sincrono)."""
+    """
+    Genera el .mp3 usando Microsoft Edge TTS (Neural).
+
+    Edge TTS emite directamente MP3; no se necesita ffmpeg ni GPU.
+    Si el texto es vacio o no existe el .txt, devuelve False.
+    """
+    try:
+        import edge_tts
+    except ImportError:
+        print("[Audio] edge-tts no esta instalado. Ejecuta: pip install edge-tts")
+        if progress_cb:
+            progress_cb(-1.0, "Error: instala edge-tts")
+        return False
+
     try:
         if not os.path.exists(txt_path):
             print(f"[Audio] No existe el archivo: {txt_path}")
@@ -100,39 +91,28 @@ def _generar_audio(
             print("[Audio] El .txt esta vacio, no se genera audio.")
             return False
 
-        print(f"[Audio] Texto: {texto[:120]}{'...' if len(texto) > 120 else ''}")
+        # Seleccionar ajustes de prosodia segun la voz
+        rate  = VOICE_RATE_MUJER   if speaker == SPEAKER_MUJER else VOICE_RATE_HOMBRE
+        pitch = VOICE_PITCH_MUJER  if speaker == SPEAKER_MUJER else VOICE_PITCH_HOMBRE
+
+        print(f"[Audio] Sintetizando con {speaker}: {texto[:80]}{'...' if len(texto)>80 else ''}")
 
         if progress_cb:
-            progress_cb(0.05, "Cargando modelos Bark...")
+            progress_cb(0.1, f"Conectando con Edge TTS...")
 
-        _cargar_modelos()
-
-        if progress_cb:
-            progress_cb(0.3, "Generando audio con Bark...")
-
-        print(f"[Audio] Sintetizando con Bark (speaker: {SPEAKER})...")
-        with torch.no_grad():
-            audio_array = generate_audio(texto, history_prompt=SPEAKER)
-
-        gc.collect()
-        torch.cuda.empty_cache()
+        async def _synthesize():
+            communicate = edge_tts.Communicate(
+                text=texto,
+                voice=speaker,
+                rate=rate,
+                pitch=pitch,
+            )
+            await communicate.save(mp3_path)
 
         if progress_cb:
-            progress_cb(0.8, "Convirtiendo a MP3...")
+            progress_cb(0.35, f"Generando voz ({speaker})...")
 
-        # Normalizar y guardar como WAV temporal, luego convertir a MP3
-        audio_norm = audio_array / (np.max(np.abs(audio_array)) + 1e-9)
-        audio_int16 = (audio_norm * 32767).astype(np.int16)
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_tmp = tmp.name
-
-        try:
-            write_wav(wav_tmp, SAMPLE_RATE, audio_int16)
-            _wav_a_mp3(wav_tmp, mp3_path)
-        finally:
-            if os.path.exists(wav_tmp):
-                os.remove(wav_tmp)
+        _run_coro(_synthesize())
 
         if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
             print(f"[Audio] MP3 guardado -> {mp3_path}")
@@ -143,7 +123,7 @@ def _generar_audio(
             raise RuntimeError("El archivo MP3 generado esta vacio o no existe.")
 
     except Exception as exc:
-        print(f"[Audio] Error general: {exc}")
+        print(f"[Audio] Error: {exc}")
         if progress_cb:
             progress_cb(-1.0, f"Error: {exc}")
         return False
@@ -154,21 +134,23 @@ def txt_a_mp3_async(
     mp3_path: str,
     on_progress: Callable[[float, str], None] | None = None,
     on_done: Callable[[bool, str], None] | None = None,
+    speaker: str = SPEAKER_HOMBRE,
 ) -> threading.Thread:
     """
     Lanza la generacion de audio en un hilo de fondo.
 
     Parametros:
-        txt_path    – ruta al .txt generado por EasyOCR
-        mp3_path    – ruta de salida del .mp3
-        on_progress – callback(fraccion: float, msg: str)  0.0-1.0
+        txt_path    - ruta al .txt generado por EasyOCR
+        mp3_path    - ruta de salida del .mp3
+        on_progress - callback(fraccion: float, msg: str)  0.0-1.0
                       fraccion=-1 indica error
-        on_done     – callback(exito: bool, ruta_mp3: str)
+        on_done     - callback(exito: bool, ruta_mp3: str)
+        speaker     - SPEAKER_MUJER o SPEAKER_HOMBRE
 
     Devuelve el Thread iniciado.
     """
     def _worker():
-        ok = _generar_audio(txt_path, mp3_path, on_progress)
+        ok = _generar_audio(txt_path, mp3_path, on_progress, speaker)
         if on_done:
             on_done(ok, mp3_path)
 
@@ -178,7 +160,7 @@ def txt_a_mp3_async(
 
 
 def reproducir_mp3(mp3_path: str) -> None:
-    """Reproduce el archivo de audio usando pygame o playsound (lo que este disponible)."""
+    """Reproduce el archivo de audio usando pygame, playsound o startfile."""
     if not os.path.exists(mp3_path):
         print(f"[Audio] Archivo no encontrado: {mp3_path}")
         return
@@ -198,7 +180,6 @@ def reproducir_mp3(mp3_path: str) -> None:
         return
     except Exception:
         pass
-    # Fallback Windows: os.startfile
     try:
         os.startfile(mp3_path)
         print(f"[Audio] Abriendo con aplicacion predeterminada: {mp3_path}")
@@ -211,21 +192,37 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Uso: python audio.py ruta/al/texto.txt [salida.mp3]")
+        print("Uso: python audio.py ruta/al/texto.txt [salida.mp3] [mujer|hombre]")
         sys.exit(1)
 
-    _txt = sys.argv[1]
-    _mp3 = sys.argv[2] if len(sys.argv) > 2 else _txt.replace(".txt", ".mp3")
+    _txt  = sys.argv[1]
+    _mp3  = sys.argv[2] if len(sys.argv) > 2 else _txt.replace(".txt", ".mp3")
+    _voz  = (SPEAKER_MUJER
+             if len(sys.argv) > 3 and sys.argv[3].lower() == "mujer"
+             else SPEAKER_HOMBRE)
 
     def _cb(frac, msg):
         bar = int(frac * 30) if frac >= 0 else 0
         print(f"\r[{'#'*bar}{' '*(30-bar)}] {msg}          ", end="", flush=True)
 
-    print(f"Convirtiendo: {_txt}  ->  {_mp3}")
-    ok = _generar_audio(_txt, _mp3, _cb)
+    print(f"Convirtiendo: {_txt}  ->  {_mp3}  (voz: {_voz})")
+    ok = _generar_audio(_txt, _mp3, _cb, _voz)
     print()
-    if ok:
-        print("Listo!")
-    else:
-        print("Fallo la generacion de audio.")
-        sys.exit(1)
+    print("Listo!" if ok else "Fallo la generacion de audio.")
+    sys.exit(0 if ok else 1)
+
+    _txt  = sys.argv[1]
+    _mp3  = sys.argv[2] if len(sys.argv) > 2 else _txt.replace(".txt", ".mp3")
+    _voz  = (SPEAKER_MUJER
+             if len(sys.argv) > 3 and sys.argv[3].lower() == "mujer"
+             else SPEAKER_HOMBRE)
+
+    def _cb(frac, msg):
+        bar = int(frac * 30) if frac >= 0 else 0
+        print(f"\r[{'#'*bar}{' '*(30-bar)}] {msg}          ", end="", flush=True)
+
+    print(f"Convirtiendo: {_txt}  ->  {_mp3}  (voz: {_voz})")
+    ok = _generar_audio(_txt, _mp3, _cb, _voz)
+    print()
+    print("Listo!" if ok else "Fallo la generacion de audio.")
+    sys.exit(0 if ok else 1)
